@@ -33,7 +33,7 @@ use IPC::Open3 ();
 use JSON::PP   ();
 use POSIX      ();
 
-our $VERSION = '1.1.1';
+our $VERSION = '1.2.0';
 
 my $SELF          = 'addon_allclear.cgi';
 my $LOG_FILE      = '/var/log/allclear.log';
@@ -138,6 +138,7 @@ sub cgi_main {
     my $hdr_ok = $whm && eval { Whostmgr::HTMLInterface::defheader( 'AllClear (IP unblock)', '', "/cgi/$SELF" ); 1 };
     print "<!DOCTYPE html><html><head><title>AllClear</title></head><body>" unless $hdr_ok;
     print page_css();
+    print page_js();
     print qq{<div class="allc">};
     print brand_bar();
     print qq{<h1>AllClear <small>search and remove an IP from every firewall layer &middot; v$VERSION</small></h1>} unless $hdr_ok;
@@ -153,13 +154,15 @@ sub cgi_main {
             my $who     = ( $ENV{REMOTE_USER} // 'whm' ) . '@' . ( $ENV{REMOTE_ADDR} // '?' );
             my $actions = unblock_all( $ip, $opts, $who );
             print render_actions($actions);
-            print qq{<h2>State after unblock</h2><div id="allc-wait" class="allc-hint">Re-scanning all firewall layers&hellip;</div>};
+            print qq{<h2>State after unblock</h2><div id="allc-wait" class="allc-loading allc-on"><span class="allc-spin"></span> Re-scanning all firewall layers&hellip;</div>};
             print safe_scan( $ip, $opts, 0 );
             print qq{<style>#allc-wait{display:none}</style>};
         }
     }
     elsif ($ip) {
+        print qq{<div id="allc-wait" class="allc-loading allc-on"><span class="allc-spin"></span> Searching all firewall layers&hellip; this can take up to a minute.</div>};
         print safe_scan( $ip, $opts, 1 );
+        print qq{<style>#allc-wait{display:none}</style>};
     }
 
     print "</div>";
@@ -712,7 +715,8 @@ sub search_form {
     return qq{<form method="get" action="$SELF" class="allc-search">}
       . qq{<input type="hidden" name="action" value="search">}
       . qq{<input type="text" name="ip" value="} . h($ipstr) . qq{" placeholder="IPv4 or IPv6 address, e.g. 203.0.113.17" autofocus size="40">}
-      . qq{ <button type="submit">Search all firewalls</button></form>};
+      . qq{ <button type="submit">Search all firewalls</button>}
+      . qq{<span class="allc-loading"><span class="allc-spin"></span> Searching all firewall layers&hellip; this can take up to a minute.</span></form>};
 }
 
 sub render_scan {
@@ -757,6 +761,7 @@ sub render_scan {
           . qq{<input type="hidden" name="ip" value="} . h( $ip->{str} ) . qq{">}
           . option_boxes($opts)
           . qq{<button type="submit" class="allc-go">Unblock } . h( $ip->{str} ) . qq{ everywhere</button>}
+          . qq{<span class="allc-loading"><span class="allc-spin"></span> Unblocking and re-scanning&hellip; please wait.</span>}
           . qq{<div class="allc-hint">Runs the CSF / BitNinja / fail2ban / cPHulk unblock commands even if nothing is listed above, then re-scans and deletes any leftover ipset, iptables and nftables entries. Allow (ACCEPT) rules are never touched.</div>}
           . "</form>";
     }
@@ -792,6 +797,23 @@ sub brand_bar {
 
 use constant EDZNET_LOGO => 'iVBORw0KGgoAAAANSUhEUgAAAUsAAAA1CAYAAADI6MmbAAAACXBIWXMAAAsTAAALEwEAmpwYAAAGp2lUWHRYTUw6Y29tLmFkb2JlLnhtcAAAAAAAPD94cGFja2V0IGJlZ2luPSLvu78iIGlkPSJXNU0wTXBDZWhpSHpyZVN6TlRjemtjOWQiPz4gPHg6eG1wbWV0YSB4bWxuczp4PSJhZG9iZTpuczptZXRhLyIgeDp4bXB0az0iQWRvYmUgWE1QIENvcmUgNi4wLWMwMDMgNzkuMTY0NTI3LCAyMDIwLzEwLzE1LTE3OjQ4OjMyICAgICAgICAiPiA8cmRmOlJERiB4bWxuczpyZGY9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkvMDIvMjItcmRmLXN5bnRheC1ucyMiPiA8cmRmOkRlc2NyaXB0aW9uIHJkZjphYm91dD0iIiB4bWxuczp4bXA9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC8iIHhtbG5zOmRjPSJodHRwOi8vcHVybC5vcmcvZGMvZWxlbWVudHMvMS4xLyIgeG1sbnM6cGhvdG9zaG9wPSJodHRwOi8vbnMuYWRvYmUuY29tL3Bob3Rvc2hvcC8xLjAvIiB4bWxuczp4bXBNTT0iaHR0cDovL25zLmFkb2JlLmNvbS94YXAvMS4wL21tLyIgeG1sbnM6c3RFdnQ9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9zVHlwZS9SZXNvdXJjZUV2ZW50IyIgeG1wOkNyZWF0b3JUb29sPSJBZG9iZSBQaG90b3Nob3AgMjIuMSAoV2luZG93cykiIHhtcDpDcmVhdGVEYXRlPSIyMDIyLTA0LTA3VDE5OjIxOjQ0KzAyOjAwIiB4bXA6TW9kaWZ5RGF0ZT0iMjAyMi0wNC0xMFQxODoxMCswMjowMCIgeG1wOk1ldGFkYXRhRGF0ZT0iMjAyMi0wNC0xMFQxODoxMCswMjowMCIgZGM6Zm9ybWF0PSJpbWFnZS9wbmciIHBob3Rvc2hvcDpDb2xvck1vZGU9IjMiIHBob3Rvc2hvcDpJQ0NQcm9maWxlPSJzUkdCIElFQzYxOTY2LTIuMSIgeG1wTU06SW5zdGFuY2VJRD0ieG1wLmlpZDo4NGRjMWE5ZC1mOWNhLWYzNDYtYjY5Ni0zZmI1MGJjZmE4ZTMiIHhtcE1NOkRvY3VtZW50SUQ9InhtcC5kaWQ6MDY0N2U5MmMtNDI5ZC0zYjRlLWIwMTMtODQ4MGRhNjZjN2NmIiB4bXBNTTpPcmlnaW5hbERvY3VtZW50SUQ9InhtcC5kaWQ6MDY0N2U5MmMtNDI5ZC0zYjRlLWIwMTMtODQ4MGRhNjZjN2NmIj4gPHhtcE1NOkhpc3Rvcnk+IDxyZGY6U2VxPiA8cmRmOmxpIHN0RXZ0OmFjdGlvbj0iY3JlYXRlZCIgc3RFdnQ6aW5zdGFuY2VJRD0ieG1wLmlpZDowNjQ3ZTkyYy00MjlkLTNiNGUtYjAxMy04NDgwZGE2NmM3Y2YiIHN0RXZ0OndoZW49IjIwMjItMDQtMDdUMTk6MjE6NDQrMDI6MDAiIHN0RXZ0OnNvZnR3YXJlQWdlbnQ9IkFkb2JlIFBob3Rvc2hvcCAyMi4xIChXaW5kb3dzKSIvPiA8cmRmOmxpIHN0RXZ0OmFjdGlvbj0ic2F2ZWQiIHN0RXZ0Omluc3RhbmNlSUQ9InhtcC5paWQ6NGI3MTIyODUtOGIyZi00ZTRmLTg2MDQtYjMyN2I4YTRlNWU4IiBzdEV2dDp3aGVuPSIyMDIyLTA0LTEwVDE2OjIxOjI1KzAyOjAwIiBzdEV2dDpzb2Z0d2FyZUFnZW50PSJBZG9iZSBQaG90b3Nob3AgMjIuMSAoV2luZG93cykiIHN0RXZ0OmNoYW5nZWQ9Ii8iLz4gPHJkZjpsaSBzdEV2dDphY3Rpb249InNhdmVkIiBzdEV2dDppbnN0YW5jZUlEPSJ4bXAuaWlkOjg0ZGMxYTlkLWY5Y2EtZjM0Ni1iNjk2LTNmYjUwYmNmYThlMyIgc3RFdnQ6d2hlbj0iMjAyMi0wNC0xMFQxODoxMCswMjowMCIgc3RFdnQ6c29mdHdhcmVBZ2VudD0iQWRvYmUgUGhvdG9zaG9wIDIyLjEgKFdpbmRvd3MpIiBzdEV2dDpjaGFuZ2VkPSIvIi8+IDwvcmRmOlNlcT4gPC94bXBNTTpIaXN0b3J5PiA8L3JkZjpEZXNjcmlwdGlvbj4gPC9yZGY6UkRGPiA8L3g6eG1wbWV0YT4gPD94cGFja2V0IGVuZD0iciI/PqdwWQEAABcoSURBVHic7Z15kCVFncd/mVn3u/vuOaDnapAB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';
 
+# Show the spinner and lock the buttons once a form is submitted, so a slow scan
+# doesn't look like a dead page and an unblock can't be submitted twice.
+sub page_js {
+    return <<'JS';
+<script>
+document.addEventListener('submit', function (e) {
+    var f = e.target;
+    if (!f.closest || !f.closest('.allc')) return;
+    var l = f.querySelector('.allc-loading');
+    if (l) l.className += ' allc-on';
+    var b = document.querySelectorAll('.allc button');
+    setTimeout(function () { for (var i = 0; i < b.length; i++) b[i].disabled = true; }, 0);
+});
+</script>
+JS
+}
+
 sub page_css {
     return <<'CSS';
 <style>
@@ -800,6 +822,10 @@ sub page_css {
 .allc h1 small{font-size:13px;color:#777;font-weight:normal}
 .allc-search input[type=text]{padding:7px 9px;font-size:15px;border:1px solid #bbb;border-radius:4px}
 .allc button{padding:7px 14px;font-size:14px;border:0;border-radius:4px;background:#1e6fd9;color:#fff;cursor:pointer}
+.allc button[disabled]{opacity:.6;cursor:wait}
+.allc-loading{display:none;align-items:center;gap:8px;margin:8px 0 0 10px;font-size:13px;color:#555}.allc-loading.allc-on{display:inline-flex}
+.allc-spin{width:14px;height:14px;border:2px solid #cfd8e3;border-top-color:#1e6fd9;border-radius:50%;animation:allc-spin .8s linear infinite}
+@keyframes allc-spin{to{transform:rotate(360deg)}}
 .allc button.allc-go{background:#c0392b;margin-top:8px}
 .allc-msg{margin:14px 0;padding:10px 12px;border-radius:4px}
 .allc-good{background:#e7f6ec;border:1px solid #9fd8b0}.allc-warn{background:#fff6e0;border:1px solid #f0cf7a}.allc-bad{background:#fdecea;border:1px solid #f1a9a0}
