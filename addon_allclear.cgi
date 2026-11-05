@@ -33,7 +33,7 @@ use IPC::Open3 ();
 use JSON::PP   ();
 use POSIX      ();
 
-our $VERSION = '1.1.0';
+our $VERSION = '1.1.1';
 
 my $SELF          = 'addon_allclear.cgi';
 my $LOG_FILE      = '/var/log/allclear.log';
