@@ -28,12 +28,13 @@ use strict;
 use warnings;
 
 use Socket qw(AF_INET AF_INET6 inet_pton inet_ntop);
+use Digest::MD5 ();
 use Fcntl qw(O_WRONLY O_APPEND O_CREAT);
 use IPC::Open3 ();
 use JSON::PP   ();
 use POSIX      ();
 
-our $VERSION = '1.2.0';
+our $VERSION = '1.3.0';
 
 my $SELF          = 'addon_allclear.cgi';
 my $LOG_FILE      = '/var/log/allclear.log';
@@ -41,6 +42,10 @@ my $CMD_TIMEOUT   = 60;
 my $CSF_ALLOW_TTL = 86400;    # seconds, for the optional "temporarily allow" step
 
 $ENV{PATH} = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+
+# The IP of whoever is using the tool (WHM: REMOTE_ADDR, shell: SSH_CLIENT).
+# Allow entries covering it can't be removed, so you can't lock yourself out.
+our $ADMIN_IP;
 
 # cPanel WHM API CLI (used for cPHulk).
 my %WHMAPI = ( bin => '/usr/local/cpanel/bin/whmapi1' );
@@ -58,11 +63,13 @@ sub main {
 sub cli_main {
     my @args = @_;
     if ( $> != 0 ) { print STDERR "Must be run as root.\n"; return 1; }
-    my ( $action, $ipstr ) = grep { !/^--/ } @args;
+    my ( $action, $ipstr, @ids ) = grep { !/^--/ } @args;
     my %opt = map { $_ => 1 } map { /^--(.+)$/ ? $1 : () } @args;
-    if ( !$action || !$ipstr || $action !~ /^(search|unblock)$/ ) {
+    $ADMIN_IP = parse_ip( ( split ' ', ( $ENV{SSH_CLIENT} // '' ) )[0] );
+    if ( !$action || !$ipstr || $action !~ /^(search|unblock|remove)$/ || ( $action eq 'remove' && !@ids ) ) {
         print "Usage: $0 search  <ip>\n"
           . "       $0 unblock <ip> [--ranges] [--csf-allow] [--bitninja-whitelist]\n"
+          . "       $0 remove  <ip> <id> [<id> ...]   remove only these entries (ids from search), allow entries included\n"
           . "  --ranges               also delete CIDR/range entries that contain the IP\n"
           . "  --csf-allow            temporarily allow the IP in CSF for ${\ ($CSF_ALLOW_TTL/3600)}h afterwards\n"
           . "  --bitninja-whitelist   add the IP to the BitNinja whitelist afterwards\n";
@@ -75,23 +82,26 @@ sub cli_main {
         bitninja_whitelist => $opt{'bitninja-whitelist'} ? 1 : 0,
     };
 
-    if ( $action eq 'unblock' ) {
-        my $actions = unblock_all( $ip, $opts, 'cli:' . ( getpwuid($<) // $< ) );
+    if ( $action eq 'unblock' || $action eq 'remove' ) {
+        my $who     = 'cli:' . ( getpwuid($<) // $< ) . ( $ADMIN_IP ? "\@$ADMIN_IP->{str}" : '' );
+        my $actions = $action eq 'remove' ? remove_selected( $ip, \@ids, $who, $ADMIN_IP ) : unblock_all( $ip, $opts, $who );
         print "== Actions ==\n";
         for my $a (@$actions) {
             printf "[%s] %s\n    $ %s\n", ( $a->{ok} ? ' ok ' : 'FAIL' ), $a->{step}, $a->{cmd};
             print map { "    | $_\n" } grep { length } split /\n/, $a->{out} if length( $a->{out} // '' );
         }
-        print "\n== Remaining after unblock ==\n";
+        print "\n== Remaining after $action ==\n";
     }
     for my $s ( scan_all($ip) ) {
         my $status = !$s->{available} ? 'not installed' : $s->{error} ? 'ERROR' : $s->{found} ? 'FOUND' : 'clear';
         printf "%-28s %s\n", $s->{title}, $status;
         print "    ! $s->{error}\n" if $s->{error};
         for my $it ( @{ $s->{items} } ) {
-            printf "    - %s%s\n", $it->{desc}, ( $it->{note} ? "  [$it->{note}]" : '' );
+            my $note = join ', ', grep { length } ( $it->{note} // '' ), ( locks_out( $it, $ip, $ADMIN_IP ) ? 'covers your own IP, protected' : '' );
+            printf "    %-14s %s%s\n", ( $it->{id} ? "[$it->{id}]" : '' ), $it->{desc}, ( $note ? "  [$note]" : '' );
         }
     }
+    print "\nRemove single entries with: allclear remove $ip->{str} <id> [<id> ...]\n";
     return 0;
 }
 
@@ -120,6 +130,7 @@ sub cgi_main {
     }
 
     $| = 1;
+    $ADMIN_IP = parse_ip( $ENV{REMOTE_ADDR} );
     my $form   = read_form();
     my $action = $form->{action} // '';
     my $ipstr  = $form->{ip}     // '';
@@ -146,18 +157,25 @@ sub cgi_main {
     print search_form( $ipstr, $opts );
     print qq{<div class="allc-msg allc-bad">} . h($error) . "</div>" if $error;
 
-    if ( $ip && $action eq 'unblock' ) {
-        if ( ( $ENV{REQUEST_METHOD} // '' ) ne 'POST' ) {
-            print qq{<div class="allc-msg allc-bad">Unblock must be submitted as a POST.</div>};
-        }
-        else {
-            my $who     = ( $ENV{REMOTE_USER} // 'whm' ) . '@' . ( $ENV{REMOTE_ADDR} // '?' );
-            my $actions = unblock_all( $ip, $opts, $who );
-            print render_actions($actions);
-            print qq{<h2>State after unblock</h2><div id="allc-wait" class="allc-loading allc-on"><span class="allc-spin"></span> Re-scanning all firewall layers&hellip;</div>};
-            print safe_scan( $ip, $opts, 0 );
-            print qq{<style>#allc-wait{display:none}</style>};
-        }
+    if ( $ip && ( $action eq 'unblock' || $action eq 'remove' ) && ( $ENV{REQUEST_METHOD} // '' ) ne 'POST' ) {
+        print qq{<div class="allc-msg allc-bad">Changes must be submitted as a POST.</div>};
+    }
+    elsif ( $ip && $action eq 'remove' ) {
+        my $who     = ( $ENV{REMOTE_USER} // 'whm' ) . '@' . ( $ENV{REMOTE_ADDR} // '?' );
+        my @ids     = map { /^sel_([0-9a-f]{12})$/ ? $1 : () } grep { $form->{$_} } keys %$form;
+        my $actions = remove_selected( $ip, \@ids, $who, $ADMIN_IP );
+        print render_actions($actions);
+        print qq{<h2>State after removal</h2><div id="allc-wait" class="allc-loading allc-on"><span class="allc-spin"></span> Re-scanning all firewall layers&hellip;</div>};
+        print safe_scan( $ip, $opts, 1 );
+        print qq{<style>#allc-wait{display:none}</style>};
+    }
+    elsif ( $ip && $action eq 'unblock' ) {
+        my $who     = ( $ENV{REMOTE_USER} // 'whm' ) . '@' . ( $ENV{REMOTE_ADDR} // '?' );
+        my $actions = unblock_all( $ip, $opts, $who );
+        print render_actions($actions);
+        print qq{<h2>State after unblock</h2><div id="allc-wait" class="allc-loading allc-on"><span class="allc-spin"></span> Re-scanning all firewall layers&hellip;</div>};
+        print safe_scan( $ip, $opts, 0 );
+        print qq{<style>#allc-wait{display:none}</style>};
     }
     elsif ($ip) {
         print qq{<div id="allc-wait" class="allc-loading allc-on"><span class="allc-spin"></span> Searching all firewall layers&hellip; this can take up to a minute.</div>};
@@ -192,9 +210,17 @@ sub scan_all {
     );
 }
 
+# Items that can be removed one by one carry `actions` (and optionally `pre`,
+# manager commands run before the kernel re-scan). Each gets a short id derived
+# from its section and description, so the same entry has the same id on the
+# next scan. Selective removal only acts on ids found again by a fresh scan.
 sub section {
     my (%s) = @_;
     $s{items} ||= [];
+    for my $it ( @{ $s{items} } ) {
+        next unless $it->{actions} && @{ $it->{actions} };
+        $it->{id} = substr( Digest::MD5::md5_hex("$s{key}|$it->{desc}"), 0, 12 );
+    }
     $s{found} = ( grep { !$_->{allow} } @{ $s{items} } ) ? 1 : 0 unless defined $s{found};
     return \%s;
 }
@@ -210,7 +236,20 @@ sub scan_csf {
         next if $line =~ /No matches found/i;
         $line =~ s/\s+$//;
         my $allow = $line =~ /\bACCEPT\b|Temporary Allows|csf\.allow|csf\.ignore|ALLOW|whitelist/i ? 1 : 0;
-        push @items, { desc => $line, allow => $allow, note => ( $allow ? 'allow entry' : '' ) };
+        my %it = ( desc => $line, allow => $allow, note => ( $allow ? 'allow entry' : '' ) );
+        if ( $line =~ /^\s*IPSET:/i ) {
+            $it{note} = join ', ', grep { length } $it{note}, 'see the ipset section';
+        }
+        elsif ( $line =~ /csf\.ignore/i ) {
+            $it{note} = 'csf.ignore entry, edit /etc/csf/csf.ignore by hand';
+        }
+        elsif ($allow) {
+            $it{actions} = [ [ 'CSF: remove from allow list', $csf, '-ar', $ip->{str} ], [ 'CSF: remove temporary allow', $csf, '-tr', $ip->{str} ] ];
+        }
+        else {
+            $it{actions} = [ [ 'CSF: remove permanent deny', $csf, '-dr', $ip->{str} ], [ 'CSF: remove temporary deny', $csf, '-trd', $ip->{str} ] ];
+        }
+        push @items, \%it;
     }
     return section(
         key       => 'csf',
@@ -228,7 +267,7 @@ sub scan_bitninja {
     # bitninjacli has no reliable "is this IP listed" query; BitNinja enforces
     # everything through its ipsets, so report those here.
     my $ipset = scan_ipset($ip);
-    my @items = map { +{ %$_, removable => 0, dup => 1, note => ( $_->{allow} ? "BitNinja whitelist, left alone" : "removed in the ipset step" ) } }
+    my @items = map { +{ %$_, removable => 0, dup => 1, actions => undef, pre => undef, id => undef, note => ( $_->{allow} ? "BitNinja whitelist, select it in the ipset section to remove" : "removed in the ipset step" ) } }
       grep { $_->{set} =~ /^(?:bitninja|heimdall)/i } @{ $ipset->{items} };
     return section(
         key       => 'bitninja',
@@ -250,7 +289,8 @@ sub scan_fail2ban {
     for my $jail ( grep { length } split /[,\s]+/, ( $jails // '' ) ) {
         my ( $jrc, $jout ) = run( $f2b, 'status', $jail );
         my ($banned) = $jout =~ /Banned IP list:\s*(.*)/;
-        push @items, { desc => "jail $jail", removable => 1 } if defined $banned && $banned =~ $re;
+        push @items, { desc => "jail $jail", removable => 1, actions => [ [ "fail2ban: unban from jail $jail", $f2b, 'set', $jail, 'unbanip', $ip->{str} ] ] }
+          if defined $banned && $banned =~ $re;
     }
     return section( key => 'fail2ban', title => 'fail2ban', available => 1, items => \@items );
 }
@@ -260,16 +300,28 @@ sub scan_cphulk {
     return section( key => 'cphulk', title => 'cPHulk', available => 0 ) unless -x $WHMAPI{bin};
     my $re = ip_regex($ip);
     my @items;
+    my $flush = [ 'cPHulk: flush login history / brute blocks', $WHMAPI{bin}, 'flush_cphulk_login_history_for_ips', "ip=$ip->{str}" ];
     my %calls = (
-        'blacklist'              => [ 'read_cphulk_records', 'list_name=black' ],
-        'brute-force blocks'     => ['get_cphulk_brutes'],
-        'excessive brute blocks' => ['get_cphulk_excessive_brutes'],
-        'failed logins'          => ['get_cphulk_failed_logins'],
+        'blacklist'              => [ [ 'read_cphulk_records', 'list_name=black' ], [ 'cPHulk: remove from blacklist', $WHMAPI{bin}, 'delete_cphulk_record', 'list_name=black', "ip=$ip->{str}" ] ],
+        'whitelist'              => [ [ 'read_cphulk_records', 'list_name=white' ], [ 'cPHulk: remove from whitelist', $WHMAPI{bin}, 'delete_cphulk_record', 'list_name=white', "ip=$ip->{str}" ] ],
+        'brute-force blocks'     => [ ['get_cphulk_brutes'],           $flush ],
+        'excessive brute blocks' => [ ['get_cphulk_excessive_brutes'], $flush ],
+        'failed logins'          => [ ['get_cphulk_failed_logins'],    $flush ],
     );
     for my $label ( sort keys %calls ) {
-        my ( $rc, $out ) = run( $WHMAPI{bin}, @{ $calls{$label} }, '--output=json' );
+        my ( $call, $action ) = @{ $calls{$label} };
+        my ( $rc, $out ) = run( $WHMAPI{bin}, @$call, '--output=json' );
         next if $rc;
-        push @items, { desc => "listed in cPHulk $label", removable => 1, list => $label } if $out =~ $re;
+        next unless $out =~ $re;
+        my $allow = $label eq 'whitelist' ? 1 : 0;
+        push @items, {
+            desc      => "listed in cPHulk $label",
+            removable => $allow ? 0 : 1,
+            allow     => $allow,
+            list      => $label,
+            note      => ( $allow ? 'allow list, skipped by Unblock everywhere' : '' ),
+            actions   => [$action],
+        };
     }
     return section(
         key       => 'cphulk',
@@ -303,14 +355,24 @@ sub scan_ipset {
             next unless net_contains( $net, $ip );
             my $timeout = $line =~ /\btimeout (\d+)/ ? $1 : undef;
             my $allow   = is_allow_name($set);
+            # BitNinja's sets: tell BitNinja first so it doesn't re-add the entry.
+            my @pre;
+            if ( $set =~ /^(?:bitninja|heimdall)/i && ( my $bn = which('bitninjacli') ) ) {
+                @pre = $allow
+                  ? ( [ 'BitNinja: remove from whitelist', $bn, '--whitelist', "--del=$ip->{str}" ] )
+                  : ( [ 'BitNinja: remove from blacklist', $bn, '--blacklist', "--del=$ip->{str}" ], [ 'BitNinja: remove from greylist', $bn, '--greylist', "--del=$ip->{str}" ] );
+            }
             push @items, {
                 set       => $set,
                 entry     => $entry,
+                net       => $net,
                 exact     => $net->{single},
                 removable => $allow ? 0 : 1,
                 allow     => $allow,
                 desc      => "Set:$set Match:$entry" . ( $type{$set} ? " ($type{$set})" : '' ),
-                note      => join( ', ', ( $allow ? 'allow list, left alone' : () ), ( $net->{single} ? () : 'range containing the IP' ), ( defined $timeout ? "expires in ${timeout}s" : () ) ),
+                note      => join( ', ', ( $allow ? 'allow list, skipped by Unblock everywhere' : () ), ( $net->{single} ? () : 'range containing the IP' ), ( defined $timeout ? "expires in ${timeout}s" : () ) ),
+                pre       => \@pre,
+                actions   => [ [ "ipset: delete from $set", $ipset, 'del', $set, $entry ] ],
             };
             last;
         }
@@ -346,19 +408,24 @@ sub scan_iptables {
         next unless $hit;
         # Only blocking targets count. ACCEPT/RETURN, non-terminating targets
         # (LOG, MARK, ...) and jumps to allow-named chains are left alone.
-        my $is_block = defined $target
-          && $target !~ /^(?:ACCEPT|RETURN|LOG|NFLOG|ULOG|MARK|CONNMARK|CT|NOTRACK|TRACE|AUDIT)$/
+        my $passive  = !defined $target || $target =~ /^(?:LOG|NFLOG|ULOG|MARK|CONNMARK|CT|NOTRACK|TRACE|AUDIT)$/;
+        my $is_block = !$passive
+          && $target !~ /^(?:ACCEPT|RETURN)$/
           && !is_allow_name($target)
           && !is_allow_name($chain);
+        my $bin = which($cmd);
         push @items, {
             table     => $table,
             chain     => $chain,
             args      => \@tok,
+            net       => $hit,
             exact     => $hit->{single},
             removable => $is_block ? 1 : 0,
             allow     => $is_block ? 0 : 1,
             desc      => "-t $table $line",
-            note      => join( ', ', ( $is_block ? () : 'allow rule, left alone' ), ( $hit->{single} ? () : 'range containing the IP' ) ),
+            note      => join( ', ', ( $passive ? 'not a block or allow rule, left alone' : $is_block ? () : 'allow rule, skipped by Unblock everywhere' ), ( $hit->{single} ? () : 'range containing the IP' ) ),
+            # Logging/marking rules are never offered for removal.
+            actions   => ( $passive || !$bin ? undef : [ [ "$cmd: delete rule in $table/$chain", $bin, '-w', '-t', $table, '-D', $chain, @tok ] ] ),
         };
     }
     return section( key => $cmd, title => $title, available => 1, items => \@items );
@@ -400,11 +467,13 @@ sub scan_nft {
                     table     => $set->{table},
                     name      => $set->{name},
                     elem      => $str,
+                    net       => $net,
                     exact     => $net->{single},
                     removable => $allow ? 0 : 1,
                     allow     => $allow,
                     desc      => "set $set->{family} $set->{table} $set->{name}: $str",
-                    note      => join( ', ', ( $allow ? 'allow list, left alone' : () ), ( $net->{single} ? () : 'range containing the IP' ) ),
+                    note      => join( ', ', ( $allow ? 'allow list, skipped by Unblock everywhere' : () ), ( $net->{single} ? () : 'range containing the IP' ) ),
+                    actions   => [ [ "nft: delete element from set $set->{table}/$set->{name}", $nft, 'delete', 'element', $set->{family}, $set->{table}, $set->{name}, '{', $str, '}' ] ],
                 };
             }
         }
@@ -420,17 +489,21 @@ sub scan_nft {
             next unless $hit;
             my $json     = JSON::PP->new->canonical->encode( $rule->{expr} // [] );
             my $is_block = $json =~ /"(?:drop|reject)"/ && $json !~ /"accept"/;
+            my $is_allow = !$is_block && $json =~ /"accept"/;
             push @items, {
                 kind      => 'rule',
                 family    => $rule->{family},
                 table     => $rule->{table},
                 chain     => $rule->{chain},
                 handle    => $rule->{handle},
+                net       => $hit,
                 exact     => $hit->{single},
                 removable => $is_block ? 1 : 0,
-            allow     => $is_block ? 0 : 1,
+                allow     => $is_block ? 0 : 1,
                 desc      => "rule $rule->{family} $rule->{table} $rule->{chain} handle $rule->{handle}: " . ( length $json > 300 ? substr( $json, 0, 300 ) . '...' : $json ),
-                note      => join( ', ', ( $is_block ? () : 'not a drop/reject rule, left alone' ), ( $hit->{single} ? () : 'range containing the IP' ) ),
+                note      => join( ', ', ( $is_block ? () : $is_allow ? 'allow rule, skipped by Unblock everywhere' : 'not a drop/reject rule, left alone' ), ( $hit->{single} ? () : 'range containing the IP' ) ),
+                # Only drop/reject and accept rules can be removed one by one.
+                actions   => ( $is_block || $is_allow ? [ [ "nft: delete rule $rule->{table}/$rule->{chain}", $nft, 'delete', 'rule', $rule->{family}, $rule->{table}, $rule->{chain}, 'handle', $rule->{handle} ] ] : undef ),
             };
         }
     }
@@ -463,17 +536,82 @@ sub nft_collect {
 # Unblocking
 # ---------------------------------------------------------------------------
 
-sub unblock_all {
-    my ( $ip, $opts, $who ) = @_;
-    my @actions;
-    my $do = sub {
+# Returns a closure that runs ( step, cmd... ), logs it and records the result
+# in @$actions. Identical commands are only run once per request.
+sub action_runner {
+    my ( $ip, $who, $actions ) = @_;
+    my %done;
+    return sub {
         my ( $step, @cmd ) = @_;
+        my $cmdstr = join( ' ', map { /[\s"'{}]/ ? "'$_'" : $_ } @cmd );
+        return if $done{$cmdstr}++;
         my ( $rc, $out ) = run(@cmd);
-        my $a = { step => $step, cmd => join( ' ', map { /[\s"'{}]/ ? "'$_'" : $_ } @cmd ), rc => $rc, ok => ( $rc == 0 ? 1 : 0 ), out => $out };
-        push @actions, $a;
+        my $a = { step => $step, cmd => $cmdstr, rc => $rc, ok => ( $rc == 0 ? 1 : 0 ), out => $out };
+        push @$actions, $a;
         audit( $who, $ip->{str}, $a );
         return $a;
     };
+}
+
+sub kernel_scans {
+    my ($ip) = @_;
+    return ( scan_ipset($ip), scan_iptables( $ip, $ip->{fam} == 4 ? 'iptables' : 'ip6tables' ), scan_nft($ip) );
+}
+
+# Would removing this allow entry take away the allow for the admin's own IP?
+sub locks_out {
+    my ( $it, $ip, $admin ) = @_;
+    return 0 unless $admin && $it->{allow};
+    return net_contains( $it->{net}, $admin ) if $it->{net};
+    return $ip->{str} eq $admin->{str} ? 1 : 0;
+}
+
+# Removes only the entries the user ticked. The ids are matched against a fresh
+# scan, so a request can only remove entries the server itself finds for this IP.
+sub remove_selected {
+    my ( $ip, $ids, $who, $admin ) = @_;
+    my @actions;
+    my $do = action_runner( $ip, $who, \@actions );
+    my %want = map { $_ => 1 } grep { /^[0-9a-f]{12}$/ } @$ids;
+    return [ { step => 'Nothing selected', cmd => '-', ok => 0, rc => '-', out => '' } ] unless %want;
+
+    audit( $who, $ip->{str}, { step => 'remove selected requested', cmd => '-', rc => 0, out => join( ',', sort keys %want ) } );
+
+    my %found = map { $_->{id} => $_ } grep { $_->{id} } map { @{ $_->{items} } } scan_all($ip);
+    my %kernel;
+    for my $id ( sort keys %want ) {
+        my $it = $found{$id};
+        if ( !$it ) {
+            push @actions, { step => "Entry $id is no longer present", cmd => '-', ok => 1, out => '' };
+            next;
+        }
+        if ( locks_out( $it, $ip, $admin ) ) {
+            my $a = { step => "Refused: removing this allow entry would drop the allow for your own IP ($admin->{str})", cmd => $it->{desc}, ok => 0, rc => '-', out => '' };
+            push @actions, $a;
+            audit( $who, $ip->{str}, $a );
+            next;
+        }
+        # 1. Managers (and BitNinja's own whitelist/blacklist for its ipsets) first.
+        $do->(@$_) for @{ $it->{pre} || [] };
+        if ( $it->{set} || $it->{table} ) { $kernel{$id} = 1 }
+        else                               { $do->(@$_) for @{ $it->{actions} } }
+    }
+
+    # 2. Kernel entries: re-scan, then delete the selected ones that are still there.
+    if (%kernel) {
+        my %now = map { $_->{id} => $_ } grep { $_->{id} } map { @{ $_->{items} } } kernel_scans($ip);
+        for my $id ( sort keys %kernel ) {
+            if ( my $it = $now{$id} ) { $do->(@$_) for @{ $it->{actions} } }
+            else { push @actions, { step => "Entry $id was already removed by its manager", cmd => '-', ok => 1, out => '' } }
+        }
+    }
+    return \@actions;
+}
+
+sub unblock_all {
+    my ( $ip, $opts, $who ) = @_;
+    my @actions;
+    my $do = action_runner( $ip, $who, \@actions );
     my $want = sub { my $it = shift; $it->{removable} && ( $it->{exact} || $opts->{ranges} ) };
 
     audit( $who, $ip->{str}, { step => 'unblock requested', cmd => '-', rc => 0, out => join( ',', grep { $opts->{$_} } sort keys %$opts ) } );
@@ -501,25 +639,9 @@ sub unblock_all {
     }
 
     # 2. Kernel state, freshly re-scanned after the managers have had their go.
-    if ( my $ipset = which('ipset') ) {
-        for my $it ( grep { $want->($_) } @{ scan_ipset($ip)->{items} } ) {
-            $do->( "ipset: delete from $it->{set}", $ipset, 'del', $it->{set}, $it->{entry} );
-        }
-    }
-    my $ipt = $ip->{fam} == 4 ? 'iptables' : 'ip6tables';
-    if ( my $bin = which($ipt) ) {
-        for my $it ( grep { $want->($_) } @{ scan_iptables( $ip, $ipt )->{items} } ) {
-            $do->( "$ipt: delete rule in $it->{table}/$it->{chain}", $bin, '-w', '-t', $it->{table}, '-D', $it->{chain}, @{ $it->{args} } );
-        }
-    }
-    if ( my $nft = which('nft') ) {
-        for my $it ( grep { $want->($_) } @{ scan_nft($ip)->{items} } ) {
-            if ( $it->{kind} eq 'set' ) {
-                $do->( "nft: delete element from set $it->{table}/$it->{name}", $nft, 'delete', 'element', $it->{family}, $it->{table}, $it->{name}, '{', $it->{elem}, '}' );
-            }
-            else {
-                $do->( "nft: delete rule $it->{table}/$it->{chain}", $nft, 'delete', 'rule', $it->{family}, $it->{table}, $it->{chain}, 'handle', $it->{handle} );
-            }
+    for my $s ( kernel_scans($ip) ) {
+        for my $it ( grep { $want->($_) } @{ $s->{items} } ) {
+            $do->(@$_) for @{ $it->{actions} || [] };
         }
     }
 
@@ -723,6 +845,7 @@ sub render_scan {
     my ( $ip, $sections, $opts, $offer_unblock ) = @_;
     my ( $total, $allows ) = ( 0, 0 );
     my $html = '';
+    my $selectable = 0;
     for my $s (@$sections) {
         my $blocks = grep { !$_->{allow} } @{ $s->{items} };
         my $allow  = grep { $_->{allow} } @{ $s->{items} };
@@ -739,8 +862,21 @@ sub render_scan {
         if ( @{ $s->{items} } ) {
             $html .= "<ul>";
             for my $it ( @{ $s->{items} } ) {
-                $html .= "<li><code>" . h( $it->{desc} ) . "</code>";
-                $html .= qq{ <span class="allc-note">} . h( $it->{note} ) . "</span>" if $it->{note};
+                my $note = $it->{note} // '';
+                my $box  = '';
+                if ( $it->{id} ) {
+                    if ( locks_out( $it, $ip, $ADMIN_IP ) ) {
+                        $box  = qq{<input type="checkbox" disabled title="Covers your own IP">};
+                        $note = join ', ', grep { length } $note, "covers your own IP ($ADMIN_IP->{str}), can't be removed here";
+                    }
+                    else {
+                        $selectable++;
+                        my $cls = $it->{allow} ? 'allc-cb allc-cb-allow' : 'allc-cb';
+                        $box = qq{<input type="checkbox" name="sel_$it->{id}" value="1" class="$cls">};
+                    }
+                }
+                $html .= ( $it->{id} ? "<li>" : qq{<li class="allc-nobox">} ) . ( $box ? qq{<label class="allc-item">$box } : '' ) . "<code>" . h( $it->{desc} ) . "</code>" . ( $box ? '</label>' : '' );
+                $html .= qq{ <span class="allc-note">} . h($note) . "</span>" if length $note;
                 $html .= "</li>";
             }
             $html .= "</ul>";
@@ -763,6 +899,19 @@ sub render_scan {
           . qq{<button type="submit" class="allc-go">Unblock } . h( $ip->{str} ) . qq{ everywhere</button>}
           . qq{<span class="allc-loading"><span class="allc-spin"></span> Unblocking and re-scanning&hellip; please wait.</span>}
           . qq{<div class="allc-hint">Runs the CSF / BitNinja / fail2ban / cPHulk unblock commands even if nothing is listed above, then re-scans and deletes any leftover ipset, iptables and nftables entries. Allow (ACCEPT) rules are never touched.</div>}
+          . "</form>";
+    }
+
+    # Per-entry removal: the sections become one form with a checkbox per entry.
+    if ($selectable) {
+        $html = qq{<form method="post" action="$SELF" class="allc-select">}
+          . qq{<input type="hidden" name="action" value="remove">}
+          . qq{<input type="hidden" name="ip" value="} . h( $ip->{str} ) . qq{">}
+          . qq{<div class="allc-hint">Tick entries to remove just those, including allow / whitelist entries.</div>}
+          . $html
+          . qq{<div class="allc-selbar"><button type="submit" class="allc-sel">Remove selected entries</button>}
+          . qq{<span class="allc-loading"><span class="allc-spin"></span> Removing selected entries&hellip; please wait.</span>}
+          . qq{<div class="allc-hint">Only the ticked entries are removed, in the same safe order as a full unblock. Removing an <strong>allow</strong> entry takes away that trust, so the IP may be blocked again. Allow entries that cover your own IP can't be removed here.</div></div>}
           . "</form>";
     }
     return $head . $form . $html;
@@ -802,9 +951,24 @@ use constant EDZNET_LOGO => 'iVBORw0KGgoAAAANSUhEUgAAAUsAAAA1CAYAAADI6MmbAAAACXB
 sub page_js {
     return <<'JS';
 <script>
+// "Remove selected" is only enabled while something is ticked.
+function allcSync() {
+    var f = document.querySelector('.allc-select');
+    if (!f) return;
+    f.querySelector('button.allc-sel').disabled = !f.querySelector('.allc-cb:checked');
+}
+document.addEventListener('change', function (e) {
+    if (e.target.classList && e.target.classList.contains('allc-cb')) allcSync();
+});
+document.addEventListener('DOMContentLoaded', allcSync);
 document.addEventListener('submit', function (e) {
     var f = e.target;
     if (!f.closest || !f.closest('.allc')) return;
+    var allows = f.querySelectorAll('.allc-cb-allow:checked').length;
+    if (allows && !window.confirm('Remove ' + allows + ' allow / whitelist entr' + (allows == 1 ? 'y' : 'ies') + '? The IP may be blocked again afterwards.')) {
+        e.preventDefault();
+        return;
+    }
     var l = f.querySelector('.allc-loading');
     if (l) l.className += ' allc-on';
     var b = document.querySelectorAll('.allc button');
@@ -823,6 +987,10 @@ sub page_css {
 .allc-search input[type=text]{padding:7px 9px;font-size:15px;border:1px solid #bbb;border-radius:4px}
 .allc button{padding:7px 14px;font-size:14px;border:0;border-radius:4px;background:#1e6fd9;color:#fff;cursor:pointer}
 .allc button[disabled]{opacity:.6;cursor:wait}
+.allc button.allc-sel{background:#8e44ad;margin-top:4px}.allc button.allc-sel[disabled]{cursor:not-allowed;opacity:.45}
+.allc-item{font-weight:normal;cursor:pointer}.allc-item input{margin:0 6px 0 0;vertical-align:middle}
+.allc-select .allc-sec ul{list-style:none;margin-left:0}.allc-select li.allc-nobox{padding-left:22px}
+.allc-selbar{margin:10px 0 16px;padding:12px;border:1px solid #ddd;border-radius:4px;background:#fafafa}
 .allc-loading{display:none;align-items:center;gap:8px;margin:8px 0 0 10px;font-size:13px;color:#555}.allc-loading.allc-on{display:inline-flex}
 .allc-spin{width:14px;height:14px;border:2px solid #cfd8e3;border-top-color:#1e6fd9;border-radius:50%;animation:allc-spin .8s linear infinite}
 @keyframes allc-spin{to{transform:rotate(360deg)}}

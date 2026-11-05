@@ -34,7 +34,7 @@ This installs `/usr/local/cpanel/whostmgr/docroot/cgi/addon_allclear.cgi`, regis
 | CSF / LFD | `csf -g IP` | `csf -dr IP`, `csf -trd IP` |
 | BitNinja | its `bitninja-*` / `heimdall-*` ipsets | `bitninjacli --blacklist --del=IP`, `--greylist --del=IP`, then ipset cleanup |
 | fail2ban | `fail2ban-client status <jail>` | `fail2ban-client unban IP` |
-| cPHulk | blacklist, brutes, excessive brutes, failed logins (whmapi1) | `delete_cphulk_record list_name=black`, `flush_cphulk_login_history_for_ips` |
+| cPHulk | blacklist, whitelist, brutes, excessive brutes, failed logins (whmapi1) | `delete_cphulk_record list_name=black`, `flush_cphulk_login_history_for_ips` |
 | ipset | `ipset save`, every set of the right family | `ipset del SET ENTRY` |
 | iptables / ip6tables | `iptables-save`, `-s/-d/--src-range/--dst-range` | `iptables -w -t TABLE -D CHAIN <rule>` |
 | nftables (native) | `nft -j list ruleset`, rules and set elements | `nft delete rule ... handle N`, `nft delete element ...` |
@@ -43,19 +43,30 @@ The unblock order matters. The managers (CSF, BitNinja, fail2ban, cPHulk) go fir
 
 Optional follow-ups help when the IP keeps getting re-blocked: a temporary CSF allow (24h, `csf -ta`) and a permanent BitNinja whitelist.
 
+### Removing single entries (including allow lists)
+
+Every entry in the search results has a checkbox. Tick the ones you want and click **Remove selected entries** to remove only those. Examples: clear a fail2ban ban but keep a BitNinja block, or take an IP off an allow list.
+
+- Allow / whitelist entries can be removed this way (CSF allow, cPHulk whitelist, BitNinja whitelist, allow ipsets, `ACCEPT` rules). The page asks for confirmation first.
+- The same safe order applies: managers first (CSF, BitNinja, fail2ban, cPHulk), then a kernel re-scan before ipset, iptables and nft entries are deleted.
+- The browser only sends entry IDs. The server matches them against a fresh scan, so only entries it really finds for that IP can be removed.
+- **Lockout guard:** allow entries that cover your own IP (the one you're using WHM or SSH from) can't be removed.
+- `csf.ignore` lines and non-blocking rules (`LOG`, `MARK`, ...) are shown but can't be ticked.
+
 ## Safety
 
-- Allow rules (`ACCEPT`/`RETURN`, or nft rules without drop/reject) are listed but never deleted. So are non-blocking targets such as `LOG`, and anything in an ipset, nft set or chain whose name contains `white`, `allow`, `trust`, `ignore` or `accept`.
-- CIDR or range entries that contain the IP (e.g. `203.0.113.0/24` in `chain_DENY`) are listed but only deleted if you tick *Also delete CIDR / range entries*. Deleting one unblocks the whole range.
+- **Unblock everywhere** never deletes allow rules (`ACCEPT`/`RETURN`, or nft rules without drop/reject), non-blocking targets such as `LOG`, or anything in an ipset, nft set or chain whose name contains `white`, `allow`, `trust`, `ignore` or `accept`. Those can only be removed one by one, as described above.
+- CIDR or range entries that contain the IP (e.g. `203.0.113.0/24` in `chain_DENY`) are listed, but Unblock everywhere only deletes them if you tick *Also delete CIDR / range entries*. Deleting one unblocks the whole range.
 - If iptables runs on the nf_tables backend, its tables are handled in the iptables section and skipped in the nft section, so nothing is deleted twice.
 - Only root (all ACLs) can use it, and it refuses to run if the WHM ACL modules can't be loaded.
-- Every unblock is logged to `/var/log/allclear.log` (mode 0600) with the WHM user, source IP, each command and its exit code.
+- Every unblock and removal is logged to `/var/log/allclear.log` (mode 0600) with the WHM user, source IP, each command and its exit code.
 
 ## Shell use
 
 ```sh
 allclear search 203.0.113.17
 allclear unblock 203.0.113.17 [--ranges] [--csf-allow] [--bitninja-whitelist]
+allclear remove  203.0.113.17 <id> [<id> ...]   # ids are shown by search
 ```
 
 ## Notes
