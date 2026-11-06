@@ -22,7 +22,7 @@ This installs `/usr/local/cpanel/whostmgr/docroot/cgi/addon_allclear.cgi`, regis
 
 ## Requirements
 
-- cPanel & WHM. Tested on cPanel 138.0.19 with CloudLinux 8.10.
+- cPanel & WHM. Tested on cPanel 138 with CloudLinux 8.10, and on cPanel DNSONLY 138 with Ubuntu 24.04 (CSF, BitNinja, cPHulk, nftables). AllClear scans whichever firewalls are installed and skips the rest.
 - Root access. The plugin only appears for root (all ACLs).
 - Any combination of CSF, BitNinja, fail2ban, cPHulk, ipset, iptables and nftables. Tools that aren't installed are skipped.
 - No extra dependencies: it uses cPanel's bundled Perl.
