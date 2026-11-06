@@ -34,7 +34,7 @@ use IPC::Open3 ();
 use JSON::PP   ();
 use POSIX      ();
 
-our $VERSION = '1.3.1';
+our $VERSION = '1.3.2';
 
 my $SELF          = 'addon_allclear.cgi';
 my $LOG_FILE      = '/var/log/allclear.log';
@@ -49,6 +49,7 @@ our $ADMIN_IP;
 
 # cPanel WHM API CLI (used for cPHulk).
 my %WHMAPI = ( bin => '/usr/local/cpanel/bin/whmapi1' );
+my $HULK_UNBAN = '/usr/local/cpanel/scripts/hulk-unban-ip';
 
 exit( main() ) unless caller;
 
@@ -319,6 +320,7 @@ sub scan_cphulk {
             removable => $allow ? 0 : 1,
             allow     => $allow,
             list      => $label,
+            cphulk_flush => ( $action == $flush ? 1 : 0 ),
             note      => ( $allow ? 'allow list, skipped by Unblock everywhere' : '' ),
             actions   => [$action],
         };
@@ -546,11 +548,32 @@ sub action_runner {
         my $cmdstr = join( ' ', map { /[\s"'{}]/ ? "'$_'" : $_ } @cmd );
         return if $done{$cmdstr}++;
         my ( $rc, $out ) = run(@cmd);
-        my $a = { step => $step, cmd => $cmdstr, rc => $rc, ok => ( $rc == 0 ? 1 : 0 ), out => $out };
+        my $ok = $rc == 0 ? 1 : 0;
+        # whmapi1 exits 0 even when the call is refused; the result is in the output.
+        $ok = 0 if $ok && $cmd[0] eq $WHMAPI{bin} && whmapi_failed($out);
+        my $a = { step => $step, cmd => $cmdstr, rc => $rc, ok => $ok, out => $out };
         push @$actions, $a;
         audit( $who, $ip->{str}, $a );
         return $a;
     };
+}
+
+# whmapi1 YAML: "metadata: result: 0" for API failures, or the legacy
+# "status: 0 / statusmsg: Permission Denied: ..." when the call is refused.
+sub whmapi_failed {
+    my ($out) = @_;
+    return 1 if ( $out // '' ) =~ /^\s*(?:result|status):\s*0\s*$/m;
+    return 0;
+}
+
+# Flush cPHulk's login history (brute / excessive brute blocks) for the IP. Some
+# servers refuse the API call (seen on DNSONLY), so fall back to cPanel's own
+# unban script when the API doesn't do it.
+sub cphulk_flush {
+    my ( $do, $ip ) = @_;
+    my $a = $do->( 'cPHulk: flush login history / brute blocks', $WHMAPI{bin}, 'flush_cphulk_login_history_for_ips', "ip=$ip->{str}" );
+    return if !$a || $a->{ok} || !-x $HULK_UNBAN;
+    $do->( 'cPHulk: unban with hulk-unban-ip (API call was refused)', $HULK_UNBAN, $ip->{str} );
 }
 
 sub kernel_scans {
@@ -593,8 +616,9 @@ sub remove_selected {
         }
         # 1. Managers (and BitNinja's own whitelist/blacklist for its ipsets) first.
         $do->(@$_) for @{ $it->{pre} || [] };
-        if ( $it->{set} || $it->{table} ) { $kernel{$id} = 1 }
-        else                               { $do->(@$_) for @{ $it->{actions} } }
+        if    ( $it->{set} || $it->{table} ) { $kernel{$id} = 1 }
+        elsif ( $it->{cphulk_flush} )        { cphulk_flush( $do, $ip ) }
+        else                                 { $do->(@$_) for @{ $it->{actions} } }
     }
 
     # 2. Kernel entries: re-scan, then delete the selected ones that are still there.
@@ -634,8 +658,7 @@ sub unblock_all {
         if ( grep { ( $_->{list} // '' ) eq 'blacklist' } @{ $s->{items} } ) {
             $do->( 'cPHulk: remove from blacklist', $WHMAPI{bin}, 'delete_cphulk_record', 'list_name=black', "ip=$ip->{str}" );
         }
-        $do->( 'cPHulk: flush login history / brute blocks', $WHMAPI{bin}, 'flush_cphulk_login_history_for_ips', "ip=$ip->{str}" )
-          if $s->{found};
+        cphulk_flush( $do, $ip ) if $s->{found};
     }
 
     # 2. Kernel state, freshly re-scanned after the managers have had their go.
