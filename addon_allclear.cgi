@@ -34,7 +34,7 @@ use IPC::Open3 ();
 use JSON::PP   ();
 use POSIX      ();
 
-our $VERSION = '1.3.2';
+our $VERSION = '1.3.3';
 
 my $SELF          = 'addon_allclear.cgi';
 my $LOG_FILE      = '/var/log/allclear.log';
@@ -969,7 +969,7 @@ sub brand_bar {
       . qq{<a href="https://edznet.dev" target="_blank" rel="noopener" title="Made by edznet.dev"><span>by</span> } . EDZNET_DEV_LOGO() . qq{<b>edznet.dev</b></a></div>};
 }
 
-use constant EDZNET_DEV_LOGO => q{<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="16" height="16" aria-hidden="true"><rect width="100" height="100" rx="16" fill="#221D18"/><g stroke="#B14A2B" stroke-width="2.2" stroke-linecap="square"><line x1="79" y1="12" x2="79" y2="24"/><line x1="73" y1="18" x2="85" y2="18"/></g><g fill="#F3EEE3"><rect x="28" y="22" width="15" height="56"/><rect x="28" y="22" width="46" height="12"/><rect x="28" y="44" width="38" height="11"/><rect x="28" y="66" width="46" height="12"/></g></svg>};
+use constant EDZNET_DEV_LOGO => q{<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="16" height="16" aria-hidden="true"><rect width="100" height="100" rx="16" fill="#0a1322"/><g fill="none" stroke="#F3EEE3" stroke-width="15"><path d="M76 31.5H33.5A2 2 0 0 0 31.5 33.5V53.5A15 15 0 0 0 46.5 68.5H76"/><path d="M46.5 50H74"/></g></svg>};
 
 # Show the spinner and lock the buttons once a form is submitted, so a slow scan
 # doesn't look like a dead page and an unblock can't be submitted twice.
@@ -1007,7 +1007,7 @@ sub page_css {
     return <<'CSS';
 <style>
 .allc{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:1100px;margin:10px 0;color:#222}
-.allc-brand{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#777;border-bottom:1px solid #eee;padding:0 0 6px;margin:0 0 10px}.allc-brand a{color:#1e6fd9;text-decoration:none}.allc-brand a[title]{display:inline-flex;align-items:center;gap:5px}.allc-brand svg{display:block}.allc-brand b{color:#221D18;font-weight:600}
+.allc-brand{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#777;border-bottom:1px solid #eee;padding:0 0 6px;margin:0 0 10px}.allc-brand a{color:#1e6fd9;text-decoration:none}.allc-brand a[title]{display:inline-flex;align-items:center;gap:5px}.allc-brand svg{display:block}.allc-brand b{color:#0a1322;font-weight:600}
 .allc h1 small{font-size:13px;color:#777;font-weight:normal}
 .allc-search input[type=text]{padding:7px 9px;font-size:15px;border:1px solid #bbb;border-radius:4px}
 .allc button{padding:7px 14px;font-size:14px;border:0;border-radius:4px;background:#1e6fd9;color:#fff;cursor:pointer}
